@@ -1,4 +1,4 @@
-name: '📦 حرفه‌ای: دانلود و ذخیره در مخزن'
+name: '📦 حرفه‌ای: دانلود و ذخیره در مخزن (با پوشه مجزا)'
 
 on:
   workflow_dispatch:
@@ -42,27 +42,29 @@ jobs:
           if [ $? -ne 0 ]; then exit 1; fi
           ls -lh downloaded_file
 
-      - name: 🧠 تشخیص نوع و استخراج نام اصلی
+      - name: 🧠 تشخیص نوع، ایجاد پوشه با زمان و نام اصلی
         id: classify
         run: |
-          # نام اصلی از لینک (بدون پارامترها)
+          # استخراج نام اصلی از لینک
           RAW_NAME=$(basename "${{ github.event.inputs.file_url }}" | sed 's/\?.*//' | sed 's/%20/ /g')
           if [ -z "$RAW_NAME" ]; then RAW_NAME="unknown_file"; fi
           
-          # جدا کردن نام پایه (بدون پسوند) برای پوشه
           BASENAME_NOEXT="${RAW_NAME%.*}"
           if [ "$BASENAME_NOEXT" = "$RAW_NAME" ]; then
-            # فایل بدون پسوند
             BASENAME_NOEXT="$RAW_NAME"
           fi
-          # نام امن برای پوشه (جایگزینی کاراکترهای غیرمجاز با _)
-          FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
-          if [ -z "$FOLDER_NAME" ]; then FOLDER_NAME="downloaded_file"; fi
           
-          # نام امن برای فایل درون آرشیو (با پسوند)
+          # پاکسازی کاراکترهای غیرمجاز در نام پوشه و فایل
+          SAFE_BASE_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
           ORIGINAL_FILENAME=$(echo "$RAW_NAME" | sed 's/[\\/:*?"<>|]/_/g')
           
-          # تشخیص MIME و دسته‌بندی
+          # ساخت برچسب زمان (سال-ماه-روز_ساعت-دقیقه-ثانیه) به وقت تهران/ایران
+          TIMESTAMP=$(TZ="Asia/Tehran" date +'%Y-%m-%d_%H-%M-%S')
+          
+          # ترکیب نام پایه فایل با تاریخ و زمان برای نام پوشه اختصاصی
+          FOLDER_NAME="${SAFE_BASE_NAME}_${TIMESTAMP}"
+          
+          # تشخیص نوع فایل (MIME) برای دسته‌بندی پوشه مادر
           MIME=$(file -b --mime-type downloaded_file)
           EXT="${RAW_NAME##*.}"
           EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
@@ -82,30 +84,33 @@ jobs:
           echo "CAT=$CAT" >> $GITHUB_ENV
           echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
           echo "ORIGINAL_FILENAME=$ORIGINAL_FILENAME" >> $GITHUB_ENV
-          echo "✅ دسته: $CAT → زیرپوشه: $FOLDER_NAME"
-          echo "📄 نام اصلی فایل: $ORIGINAL_FILENAME"
+          echo "✅ دسته: $CAT → پوشه اختصاصی: $FOLDER_NAME"
+          echo "📄 نام اصلی فایل زیپ: $ORIGINAL_FILENAME.7z"
 
       - name: 🔄 تغییر نام فایل به نام اصلی
         run: |
           mv downloaded_file "${{ env.ORIGINAL_FILENAME }}"
           echo "فایل به نام ${{ env.ORIGINAL_FILENAME }} تغییر نام یافت"
-          ls -lh "${{ env.ORIGINAL_FILENAME }}"
 
-      - name: 🗜️ فشرده‌سازی و تقسیم (با اعمال رمز)
+      - name: 🗜️ فشرده‌سازی و تقسیم درون پوشه زمان‌دار
         run: |
           FINAL_DIR="downloads/${{ env.CAT }}/${{ env.FOLDER_NAME }}"
           mkdir -p "$FINAL_DIR"
           
-          rm -f "$FINAL_DIR"/*.7z*
-          
           if [ -z "${{ github.event.inputs.password }}" ]; then
-            7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./${{ env.ORIGINAL_FILENAME }}"
+            7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/${{ env.ORIGINAL_FILENAME }}._7z" "./${{ env.ORIGINAL_FILENAME }}"
           else
-            7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./${{ env.ORIGINAL_FILENAME }}"
+            7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/${{ env.ORIGINAL_FILENAME }}._7z" "./${{ env.ORIGINAL_FILENAME }}"
           fi
           
-          echo "✅ پوشه: $FINAL_DIR"
-          echo "✅ فایل درون آرشیو: ${{ env.ORIGINAL_FILENAME }}"
+          # اصلاح یک باگ کوچک گیت‌هاب در نام‌گذاری پارت‌ها: تغییر نام از ._7z.001 به .7z.001
+          for f in "$FINAL_DIR"/*._7z.*; do
+            if [ -f "$f" ]; then
+              mv "$f" "${f/._7z./.7z.}"
+            fi
+          done
+          
+          echo "✅ فایل‌ها با موفقیت در پوشه زیر ذخیره شدند:"
           ls -lh "$FINAL_DIR"
 
       - name: 📝 کامیت و پوش به مخزن
@@ -113,5 +118,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add downloads/
-          git commit -m "Add downloaded file: ${{ env.ORIGINAL_FILENAME }} (category: ${{ env.CAT }})" || echo "Nothing to commit"
+          git commit -m "Add downloaded file: ${{ env.ORIGINAL_FILENAME }} (Folder: ${{ env.FOLDER_NAME }})" || echo "Nothing to commit"
           git push
