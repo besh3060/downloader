@@ -1,0 +1,138 @@
+name: '📦 دانلود و ذخیره در گوگل درایو'
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: '🔗 لینک مستقیم فایل‌ها (با کاما جدا کنید) مثال: url1,url2,url3'
+        required: true
+        type: string
+      password:
+        description: '🔐 رمز فایل فشرده (اختیاری - در صورت وارد کردن، فایل 7z یکپارچه ساخته می‌شود)'
+        required: false
+        type: string
+      drive_folder_id:
+        description: '🆔 شناسه پوشه گوگل درایو (اختیاری - در صورت خالی بودن، از شناسه پیش‌فرض تنظیمات استفاده می‌شود)'
+        required: false # 👈 تغییر به false تا پر کردنش اجباری نباشد
+        type: string
+
+jobs:
+  download-to-gdrive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔄 دریافت کد مخزن
+        uses: actions/checkout@v4
+
+      - name: ⚙️ نصب ابزارها (شامل Rclone)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full file aria2 curl
+          sudo curl https://rclone.org/install.sh | sudo bash
+
+      - name: 🔧 تنظیم کلید گوگل درایو و Rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          
+          # ساخت کانفیگ رکلون با توکن شخصی OAuth
+          cat << EOF > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          token = ${{ secrets.GDRIVE_TOKEN }}
+          EOF
+
+      - name: 📥 پردازش، دانلود و آپلود فایل‌ها
+        run: |
+          echo "${{ github.event.inputs.file_urls }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > /tmp/urls.txt
+          TOTAL_URLS=$(wc -l < /tmp/urls.txt)
+          echo "🔹 تعداد کل لینک‌ها: $TOTAL_URLS"
+
+          COUNTER=0
+          while IFS= read -r URL; do
+            [ -z "$URL" ] && continue
+            COUNTER=$((COUNTER+1))
+            echo ""
+            echo "============================================================"
+            echo "🔽 [${COUNTER}/${TOTAL_URLS}] شروع پردازش: $URL"
+            echo "============================================================"
+
+            # ----- مرحله 1: شناسایی نام فایل -----
+            REAL_FILENAME=$(curl -sI "$URL" | grep -i 'Content-Disposition' | sed -n 's/.*filename="\([^"]*\)".*/\1/p')
+            if [ -z "$REAL_FILENAME" ]; then
+              REAL_FILENAME=$(echo "$URL" | grep -oP '(?<=filename=)[^&]+' | sed 's/%20/ /g' 2>/dev/null || true)
+            fi
+            if [ -z "$REAL_FILENAME" ]; then
+              REAL_FILENAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
+            fi
+            if [ -z "$REAL_FILENAME" ]; then
+              REAL_FILENAME="file_$(date +%s)"
+            fi
+            SAFE_FILENAME=$(echo "$REAL_FILENAME" | sed 's/[\\/:*?"<>|]/_/g')
+            echo "   📛 نام پایه: $SAFE_FILENAME"
+
+            # ----- مرحله 2: دانلود با نمایش درصد پیشرفت -----
+            echo "⏳ [2/4] دانلود فایل..."
+            aria2c --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                   --max-connection-per-server=4 --split=4 --min-split-size=1M \
+                   --continue=true --retry-wait=10 --max-tries=10 --timeout=60 \
+                   --summary-interval=5 -o "$SAFE_FILENAME" "$URL"
+
+            # ----- مرحله 3: اصلاح پسوند -----
+            REAL_MIME=$(file -b --mime-type "$SAFE_FILENAME")
+            EXT=""
+            case "$REAL_MIME" in
+              video/mp4) EXT="mp4" ;; video/webm) EXT="webm" ;;
+              video/x-matroska) EXT="mkv" ;; audio/mpeg) EXT="mp3" ;;
+              audio/ogg) EXT="ogg" ;; image/jpeg) EXT="jpg" ;;
+              image/png) EXT="png" ;; application/pdf) EXT="pdf" ;;
+            esac
+            if [ -n "$EXT" ]; then
+              NEW_NAME="${SAFE_FILENAME%.*}.$EXT"
+              if [ "$NEW_NAME" != "$SAFE_FILENAME" ]; then
+                mv "$SAFE_FILENAME" "$NEW_NAME"
+                SAFE_FILENAME="$NEW_NAME"
+              fi
+            fi
+
+            # پوشه موقت برای سازماندهی فایل نهایی قبل از آپلود
+            LOCAL_TMP_DIR="/tmp/archive_out"
+            mkdir -p "$LOCAL_TMP_DIR"
+            rm -f "$LOCAL_TMP_DIR"/*
+
+            # ----- مرحله 4: بررسی وضعیت رمزنگاری و آماده‌سازی خروجی -----
+            BASENAME_NOEXT="${SAFE_FILENAME%.*}"
+            FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
+            [ -z "$FOLDER_NAME" ] && FOLDER_NAME="downloaded_file"
+
+            if [ -z "${{ github.event.inputs.password }}" ]; then
+              echo "📁 [3/4] حالت بدون رمز: انتقال مستقیم فایل اصلی بدون فشرده‌سازی..."
+              mv "$SAFE_FILENAME" "$LOCAL_TMP_DIR/"
+              UPLOAD_TARGET="$LOCAL_TMP_DIR/$SAFE_FILENAME"
+            else
+              echo "🔐 [3/4] حالت رمزدار: ایجاد آرشیو 7z یکپارچه و رمزگذاری شده..."
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 "$LOCAL_TMP_DIR/${FOLDER_NAME}.7z" "./$SAFE_FILENAME" > /dev/null
+              rm -f "$SAFE_FILENAME"
+              UPLOAD_TARGET="$LOCAL_TMP_DIR/${FOLDER_NAME}.7z"
+            fi
+
+            # ----- مرحله 5: آپلود مستقیم به گوگل درایو -----
+            echo "📤 [4/4] آپلود به گوگل درایو..."
+            
+            # منطق انتخاب متغیر پیش‌فرض: اگر فیلد ورودی خالی بود، سکرت گیت‌هاب جایگزین می‌شود
+            INPUT_ID="${{ github.event.inputs.drive_folder_id }}"
+            DRIVE_ID="${INPUT_ID:-${{ secrets.DEFAULT_GDRIVE_ID }}}"
+            
+            if [ -z "$DRIVE_ID" ]; then
+              echo "❌ خطا: هیچ شناسه پوشه‌ای یافت نشد! لطفا فیلد را پر کنید یا سکرت DEFAULT_GDRIVE_ID را تعریف کنید."
+              exit 1
+            fi
+            
+            echo "   📂 شناسه پوشه هدف: $DRIVE_ID"
+
+            # فایل به صورت مستقیم در ریشه پوشه مشخص شده در گوگل درایو آپلود می‌شود
+            rclone copyto "$UPLOAD_TARGET" "gdrive,root_folder_id=$DRIVE_ID:$(basename "$UPLOAD_TARGET")" --progress
+            
+            rm -rf "$LOCAL_TMP_DIR"
+            echo "✅ فایل $COUNTER با موفقیت و به صورت یکپارچه فرستاده شد."
+
+          done < /tmp/urls.txt
